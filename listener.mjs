@@ -32,7 +32,20 @@ if (serviceAccountEnv) {
 }
 
 const db = getFirestore();
-db.settings({ ignoreUndefinedProperties: true });
+db.settings({ ignoreUndefinedProperties: true, preferRest: false });
+
+// Pre-warm Firestore gRPC HTTP/2 channel & OAuth2 token on boot and keep it warm every 45s
+// so the very first payment write never suffers a cold-start gRPC handshake delay
+async function prewarmFirestoreChannel() {
+  try {
+    await db
+      .collection("system_settings")
+      .doc("aba_live_feed")
+      .set({ listenerHeartbeatAt: Date.now() }, { merge: true });
+  } catch (e) {}
+}
+prewarmFirestoreChannel();
+setInterval(prewarmFirestoreChannel, 45000);
 
 // 2. In-Memory Ring Buffer & SSE Clients for <5ms Instant Delivery
 const recentPaymentsBuffer = [];
