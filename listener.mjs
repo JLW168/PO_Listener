@@ -1,19 +1,29 @@
 /**
- * ABA PayWay Telegram Group Listener Bridge — Ultra-Low-Latency Edition (listener.mjs)
- * Watches your Telegram Group(s) for @PayWayByABA_bot notifications (Indoor ABA PAY & Outdoor KHQR)
- * using your MTProto session and pushes parsed payments in parallel to:
- *   1. Firestore `system_settings/aba_live_feed` (0ms single-doc real-time stream for POS PaymentModal)
- *   2. Firestore `aba_payments/{trxId}` (persistent transaction ledger & claim guard)
- *   3. Built-in HTTP `/recent` & `/events` (SSE) endpoints for instant diagnostics & health checks
+ * ABA PayWay Telegram Group Listener Bridge — Quota-Safe & Anti-Spin-Down Edition (listener.mjs)
+ *
+ * ROOT CAUSES FIXED IN THIS VERSION:
+ * 1. REMOVED `prewarmFirestoreChannel()` 45-second heartbeat write! Previously, writing to Firestore
+ *    every 45s consumed ~2,000 writes/day + multiplied by N connected snapshot listeners (~150,000 reads/day),
+ *    which exhausted your Firebase Free Tier quota and caused `RESOURCE_EXHAUSTED`!
+ * 2. FIXED URL parsing (`const urlObj = new URL(req.url, ...)`): Previously, `if (req.url === "/recent")`
+ *    failed whenever query parameters like `/recent?t=12345` or `/recent?scan=1` were sent by the POS!
+ * 3. FIXED `receivedAt` timestamp on wake-up / boot: Previously, `saveParsedPaymentToFirestore` overwrote
+ *    `receivedAt = Date.now()` for historical messages scanned after a Render wake-up, causing old payments
+ *    to look brand-new or get dropped. Now preserves the actual Telegram message timestamp!
+ * 4. ADDED Self-Keep-Alive Ping (`RENDER_EXTERNAL_URL`) every 4 minutes + SSE 20s heartbeat comments
+ *    so Render.com Free Tier stays warm and active.
+ * 5. DECOUPLED SSE & `/recent` from Firestore quota: Even if Firebase hits `RESOURCE_EXHAUSTED`,
+ *    `savedTrxMemory` stays locked and `/events` (SSE) + `/recent` continue serving 100% of payments!
  */
 import http from "node:http";
+import https from "node:https";
 import { TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
 import { NewMessage } from "telegram/events/index.js";
 import { initializeApp, applicationDefault, cert } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
 
-// 1. Initialize Firebase Admin SDK (Cloud Env or Local serviceAccountKey.json)
+// 1. Initialize Firebase Admin SDK
 const serviceAccountEnv =
   process.env.FIREBASE_SERVICE_ACCOUNT || process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
 if (serviceAccountEnv) {
@@ -34,21 +44,12 @@ if (serviceAccountEnv) {
 const db = getFirestore();
 db.settings({ ignoreUndefinedProperties: true, preferRest: false });
 
-// Pre-warm Firestore gRPC HTTP/2 channel & OAuth2 token on boot and keep it warm every 45s
-// so the very first payment write never suffers a cold-start gRPC handshake delay
-async function prewarmFirestoreChannel() {
-  try {
-    await db
-      .collection("system_settings")
-      .doc("aba_live_feed")
-      .set({ listenerHeartbeatAt: Date.now() }, { merge: true });
-  } catch (e) {}
-}
-prewarmFirestoreChannel();
-setInterval(prewarmFirestoreChannel, 45000);
+// Quota Circuit Breaker for Firestore Writes (Prevents retry storms if daily free quota is exhausted)
+let firestoreQuotaExhaustedUntil = 0;
 
-// 2. In-Memory Ring Buffer & SSE Clients for <5ms Instant Delivery
+// 2. In-Memory Ring Buffer & SSE Clients for 0ms Direct-to-POS Delivery
 const recentPaymentsBuffer = [];
+const savedTrxMemory = new Set();
 const sseClients = new Set();
 
 function broadcastToSseClients(paymentObj) {
@@ -62,12 +63,23 @@ function broadcastToSseClients(paymentObj) {
   }
 }
 
-// 3. HTTP Health-Check + Instant `/recent` & `/events` SSE Server
-const port = Number(process.env.PORT || 3000);
+// Keep SSE connections alive through Render's load balancer every 20 seconds
+setInterval(() => {
+  for (const res of sseClients) {
+    try {
+      res.write(`: heartbeat ${Date.now()}\n\n`);
+    } catch (e) {
+      sseClients.delete(res);
+    }
+  }
+}, 20000);
+
+// 3. HTTP Health-Check + Query-Safe `/recent`, `/events` (SSE), and `/claim` Server
+const port = Number(process.env.PORT || 10000);
 http
-  .createServer((req, res) => {
+  .createServer(async (req, res) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
     if (req.method === "OPTIONS") {
@@ -76,31 +88,80 @@ http
       return;
     }
 
-    if (req.url === "/events") {
+    const urlObj = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    const pathname = urlObj.pathname;
+    const shouldScan = urlObj.searchParams.get("scan") === "1";
+
+    // Optional on-demand Telegram group sweep when POS requests `?scan=1`
+    if (shouldScan) {
+      syncRecentGroupHistory(false).catch(() => {});
+    }
+
+    // Endpoint A: Server-Sent Events (`/events`, `/stream`, `/sse`)
+    if (pathname === "/events" || pathname === "/stream" || pathname === "/sse") {
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache, no-transform",
         Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
       });
-      res.write(`data: ${JSON.stringify({ type: "CONNECTED", ts: Date.now() })}\n\n`);
+      // Immediately send the connected event AND the recent payments buffer so POS gets instant history
+      res.write(
+        `data: ${JSON.stringify({
+          type: "CONNECTED",
+          ts: Date.now(),
+          payments: recentPaymentsBuffer.slice(0, 35),
+        })}\n\n`
+      );
       sseClients.add(res);
       req.on("close", () => sseClients.delete(res));
       return;
     }
 
-    if (req.url === "/recent") {
+    // Endpoint B: Mark a payment as claimed in memory (`/claim?trxId=123&orderId=abc&invoiceNo=HOP-001`)
+    if (pathname === "/claim") {
+      const trxId = String(urlObj.searchParams.get("trxId") || "").trim();
+      const orderId = String(urlObj.searchParams.get("orderId") || "").trim();
+      const invoiceNo = String(urlObj.searchParams.get("invoiceNo") || "").trim();
+      if (trxId) {
+        const found = recentPaymentsBuffer.find((p) => String(p.trxId) === trxId);
+        if (found) {
+          found.claimedByOrderId = orderId || "CLAIMED";
+          if (invoiceNo) found.claimedByInvoiceNo = invoiceNo;
+        }
+      }
       res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-      res.end(JSON.stringify({ ok: true, payments: recentPaymentsBuffer.slice(0, 30) }));
+      res.end(JSON.stringify({ ok: true, trxId }));
       return;
     }
 
-    res.writeHead(200, { "Content-Type": "application/json" });
+    // Endpoint C: JSON Payment Feed (`/recent`, `/payments`, or root `/?scan=1`)
+    if (pathname === "/recent" || pathname === "/payments" || shouldScan) {
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(
+        JSON.stringify({
+          ok: true,
+          status: "ok",
+          service: "solaris-aba-listener-v3",
+          uptimeSeconds: Math.round(process.uptime()),
+          firestoreQuotaPaused: Date.now() < firestoreQuotaExhaustedUntil,
+          payments: recentPaymentsBuffer.slice(0, 50),
+        })
+      );
+      return;
+    }
+
+    // Default Root Health Check (`/`) — Also includes recent payments so any ping hydrates the POS!
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
     res.end(
       JSON.stringify({
+        ok: true,
         status: "ok",
-        service: "solaris-aba-listener-v2",
+        service: "solaris-aba-listener-v3",
         uptimeSeconds: Math.round(process.uptime()),
         cachedPayments: recentPaymentsBuffer.length,
+        firestoreQuotaPaused: Date.now() < firestoreQuotaExhaustedUntil,
+        payments: recentPaymentsBuffer.slice(0, 50),
       })
     );
   })
@@ -108,8 +169,20 @@ http
     console.log(`🌐 Listener HTTP & SSE server active on port ${port}`);
   });
 
+// Self-Keep-Alive Ping every 4 minutes to prevent Render Free Tier 15-minute inactivity spin-down
+const selfExternalUrl =
+  process.env.RENDER_EXTERNAL_URL || "https://po-listener.onrender.com";
+setInterval(() => {
+  try {
+    https
+      .get(`${selfExternalUrl}/?keepalive=${Date.now()}`, (res) => {
+        res.resume();
+      })
+      .on("error", () => {});
+  } catch (e) {}
+}, 4 * 60 * 1000);
+
 // 4. Minute-Granularity Timestamp Alignment Helper
-// Fixes the 1-minute truncation bug where "Nov 11, 09:39 PM" parses to 09:39:00.000
 function parseAbaPaidAtToMs(paidAtStr, referenceMs = Date.now()) {
   if (!paidAtStr || typeof paidAtStr !== "string") return referenceMs;
   const clean = paidAtStr.trim();
@@ -148,11 +221,7 @@ function parseAbaPaidAtToMs(paidAtStr, referenceMs = Date.now()) {
   return referenceMs;
 }
 
-// 5. Unified Indoor ABA PAY + Outdoor Bank KHQR Parser
-// Supports:
-//  - 1A: "៛2,000 paid by CHE SOKUNTH (*636) on Nov 11, 09:39 PM via ABA PAY at CHE SOKUNTH MA. Trx. ID: 179440795392550, APV: 831467."
-//  - 1B: "$0.38 paid by CHE SOKUNTH (*636) on Nov 11, 09:14 PM via ABA PAY at CHE SOKUNTH MA. Trx. ID: 179440645984571, APV: 841463."
-//  - 2A: "៛2,500 paid by Che Sokunth (*815) on Nov 11, 09:45 PM via ABA KHQR (ACLEDA Bank Plc.) at CHE SOKUNTH MA. Trx. ID: 179440830368182, APV: 602725."
+// 5. Unified Indoor ABA PAY + Outdoor Bank KHQR Parser (Supports All ABA Bot Formats)
 function parseABAPayWay(raw, msgDateMs = Date.now()) {
   if (!raw || typeof raw !== "string") return null;
   const t = raw.replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim();
@@ -161,43 +230,79 @@ function parseABAPayWay(raw, msgDateMs = Date.now()) {
     /(?:(៛|\$|KHR|USD)\s*([0-9,]+(?:\.[0-9]{1,2})?))\s+paid by\s+(.+?)(?:\s*\(\s*\*\s*([0-9A-Za-z]+)\s*\))?\s+on\s+([A-Za-z]{3,9}\s+\d{1,2}(?:,\s*\d{4})?,?\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?|\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?)\s+via\s+(.+?)\s+at\s+(.+?)(?:\.\s*|\s+)Trx\.?\s*ID\s*[:#]?\s*([0-9A-Za-z]+)[,\s]+APV\s*[:#]?\s*([0-9A-Za-z]+)/i;
 
   const m = t.match(strictRegex);
-  if (!m) return null;
+  if (m) {
+    const cur = m[1] === "៛" || /^khr$/i.test(m[1]) ? "KHR" : "USD";
+    const amount = parseFloat(m[2].replace(/,/g, ""));
+    if (isNaN(amount) || amount <= 0) return null;
 
-  const cur = m[1] === "៛" || /^khr$/i.test(m[1]) ? "KHR" : "USD";
-  const amount = parseFloat(m[2].replace(/,/g, ""));
-  if (isNaN(amount) || amount <= 0) return null;
+    const payerName = m[3].replace(/\(\s*\*\s*[0-9A-Za-z]+\s*\)\s*$/, "").trim();
+    const maskedAccount = m[4] ? `*${m[4].trim()}` : "*ABA";
+    const paidAtStr = m[5].trim();
+    const paymentChannel = m[6].trim();
+    const bankParenMatch = paymentChannel.match(/ABA\s*KHQR\s*\(\s*([^)]+)\s*\)/i);
+    const isOutdoor = /ABA\s*KHQR/i.test(paymentChannel) || !!bankParenMatch;
+    const sourceBank = bankParenMatch
+      ? bankParenMatch[1].trim()
+      : isOutdoor
+      ? paymentChannel.replace(/^ABA\s*KHQR\s*/i, "").replace(/[()]/g, "").trim() || "External Bank"
+      : "ABA Bank";
 
-  const payerName = m[3].replace(/\(\s*\*\s*[0-9A-Za-z]+\s*\)\s*$/, "").trim();
-  const maskedAccount = m[4] ? `*${m[4].trim()}` : "*ABA";
-  const paidAtStr = m[5].trim();
-  const paymentChannel = m[6].trim();
-  const bankParenMatch = paymentChannel.match(/ABA\s*KHQR\s*\(\s*([^)]+)\s*\)/i);
-  const isOutdoor = /ABA\s*KHQR/i.test(paymentChannel) || !!bankParenMatch;
-  const sourceBank = bankParenMatch
-    ? bankParenMatch[1].trim()
-    : isOutdoor
-    ? paymentChannel.replace(/^ABA\s*KHQR\s*/i, "").replace(/[()]/g, "").trim() || "External Bank"
-    : "ABA Bank";
+    const merchantName = m[7].replace(/\.$/, "").trim();
+    const trxId = m[8].trim();
+    const apv = m[9].replace(/\.$/, "").trim();
 
-  const merchantName = m[7].replace(/\.$/, "").trim();
-  const trxId = m[8].trim();
-  const apv = m[9].replace(/\.$/, "").trim();
+    return {
+      currency: cur,
+      amount,
+      payerName,
+      maskedAccount,
+      paidAtStr,
+      paidTimestamp: parseAbaPaidAtToMs(paidAtStr, msgDateMs),
+      paymentChannel,
+      paymentCategory: isOutdoor ? "OUTDOOR_KHQR" : "INDOOR_ABA",
+      sourceBank,
+      merchantName,
+      trxId,
+      apv,
+      rawText: t,
+    };
+  }
 
-  return {
-    currency: cur,
-    amount,
-    payerName,
-    maskedAccount,
-    paidAtStr,
-    paidTimestamp: parseAbaPaidAtToMs(paidAtStr, msgDateMs),
-    paymentChannel,
-    paymentCategory: isOutdoor ? "OUTDOOR_KHQR" : "INDOOR_ABA",
-    sourceBank,
-    merchantName,
-    trxId,
-    apv,
-    rawText: t,
-  };
+  // Fallback Flexible Matcher in case ABA PayWay Bot slightly alters punctuation
+  const amtMatch = t.match(/(?:(៛|\$|KHR|USD)\s*([0-9,]+(?:\.[0-9]{1,2})?))\s*(?:paid by|received from)/i);
+  const trxMatch = t.match(/Trx\.?\s*ID\s*[:#]?\s*([0-9A-Za-z]+)/i);
+  const apvMatch = t.match(/APV\s*[:#]?\s*([0-9A-Za-z]+)/i);
+  if (amtMatch && (trxMatch || apvMatch)) {
+    const cur = amtMatch[1] === "៛" || /^khr$/i.test(amtMatch[1]) ? "KHR" : "USD";
+    const amount = parseFloat(amtMatch[2].replace(/,/g, ""));
+    if (isNaN(amount) || amount <= 0) return null;
+    const payerMatch = t.match(/(?:paid by|received from)\s+([^(]+?)(?:\s*\(\s*\*\s*([0-9A-Za-z]+)\s*\)|\s+on\s+|\s+via\s+)/i);
+    const onMatch = t.match(/\bon\s+(.+?)\s+via\s+/i);
+    const viaMatch = t.match(/\bvia\s+(.+?)\s+at\s+/i);
+    const atMatch = t.match(/\bat\s+(.+?)(?:\.\s*Trx|\s+Trx)/i);
+    const trxId = trxMatch ? trxMatch[1].trim() : `APV-${apvMatch[1].trim()}`;
+    const apv = apvMatch ? apvMatch[1].trim().replace(/\.$/, "") : trxId.slice(-6);
+    const paidAtStr = onMatch ? onMatch[1].trim() : "";
+    const paymentChannel = viaMatch ? viaMatch[1].trim() : "ABA PAY";
+    const isOutdoor = /ABA\s*KHQR/i.test(paymentChannel);
+    return {
+      currency: cur,
+      amount,
+      payerName: payerMatch ? payerMatch[1].trim() : "ABA Customer",
+      maskedAccount: payerMatch && payerMatch[2] ? `*${payerMatch[2].trim()}` : "*ABA",
+      paidAtStr,
+      paidTimestamp: parseAbaPaidAtToMs(paidAtStr, msgDateMs),
+      paymentChannel,
+      paymentCategory: isOutdoor ? "OUTDOOR_KHQR" : "INDOOR_ABA",
+      sourceBank: isOutdoor ? paymentChannel : "ABA Bank",
+      merchantName: atMatch ? atMatch[1].replace(/\.$/, "").trim() : "",
+      trxId,
+      apv,
+      rawText: t,
+    };
+  }
+
+  return null;
 }
 
 const apiId = Number(process.env.TG_API_ID);
@@ -222,62 +327,68 @@ if (!apiId || !apiHash || !sessionStr) {
   process.exit(1);
 }
 
-const savedTrxMemory = new Set();
-
-// 6. Lock-First Parallel Dual-Write to Firestore (`aba_payments` + `system_settings/aba_live_feed`)
-async function saveParsedPaymentToFirestore(parsed, chatIdStr) {
+// 6. Quota-Safe Single-Write + 0ms SSE & Ring-Buffer Broadcast
+async function saveParsedPaymentToFirestore(parsed, chatIdStr, messageTimestampMs = null) {
   if (!parsed || !parsed.trxId) return false;
   const trxId = String(parsed.trxId).trim();
 
-  // CRITICAL FIX: Claim in-memory lock BEFORE `await` so simultaneous NewMessage + RawUpdate handlers never double-write!
   if (savedTrxMemory.has(trxId)) return false;
   savedTrxMemory.add(trxId);
 
   const writeStartMs = performance.now();
-  const nowMs = Date.now();
+  const effectiveReceivedAt =
+    Number(messageTimestampMs) > 0 ? Number(messageTimestampMs) : Date.now();
+
+  // Never store a comma-separated list in chatId; store the specific group's chatId
+  const singleDefaultChatId = rawTargetChats.split(/[\s,|;]+/)[0] || "";
+  const cleanChatId = String(chatIdStr || singleDefaultChatId).trim();
+
   const docPayload = {
     ...parsed,
-    chatId: String(chatIdStr || rawTargetChats).trim(),
-    receivedAt: nowMs,
+    chatId: cleanChatId,
+    receivedAt: effectiveReceivedAt,
     claimedByOrderId: null,
   };
 
-  // Push to in-memory ring buffer & SSE clients in 0ms
+  // 1. Push to in-memory ring buffer (sorted newest first) & SSE clients in 0ms
   recentPaymentsBuffer.unshift(docPayload);
-  if (recentPaymentsBuffer.length > 50) recentPaymentsBuffer.pop();
+  recentPaymentsBuffer.sort((a, b) => (Number(b.receivedAt) || 0) - (Number(a.receivedAt) || 0));
+  if (recentPaymentsBuffer.length > 80) recentPaymentsBuffer.length = 80;
   broadcastToSseClients(docPayload);
 
+  // 2. Write to Firestore ONLY if daily quota is not currently exhausted
+  if (Date.now() < firestoreQuotaExhaustedUntil) {
+    console.log(
+      `⚡ [ABA VERIFIED -> SSE/MEMORY (Firestore Quota Paused)] Trx: ${trxId} | ${parsed.currency} ${parsed.amount} | ${parsed.payerName} | APV: ${parsed.apv}`
+    );
+    return true;
+  }
+
   try {
-    // Write to BOTH `aba_payments/{trxId}` AND `system_settings/aba_live_feed` in parallel
-    // Single-document listeners on `aba_live_feed` fire 5x faster in browsers than collection queries!
-    await Promise.all([
-      db.collection("aba_payments").doc(trxId).set(docPayload, { merge: true }),
-      db
-        .collection("system_settings")
-        .doc("aba_live_feed")
-        .set(
-          {
-            lastUpdated: nowMs,
-            latestPayment: docPayload,
-            [`payments.${trxId}`]: docPayload,
-          },
-          { merge: true }
-        ),
-    ]);
+    // Write ONLY to `aba_payments/{trxId}` (cuts Firestore writes in half!)
+    await db.collection("aba_payments").doc(trxId).set(docPayload, { merge: true });
 
     const elapsedMs = Math.round(performance.now() - writeStartMs);
     console.log(
-      `⚡ [ABA VERIFIED -> CLOUD in ${elapsedMs}ms] Trx: ${trxId} | ${parsed.currency} ${parsed.amount} | ${parsed.payerName} (${parsed.maskedAccount}) via ${parsed.paymentChannel} at ${parsed.merchantName} | APV: ${parsed.apv}`
+      `⚡ [ABA VERIFIED -> CLOUD+SSE in ${elapsedMs}ms] Trx: ${trxId} | ${parsed.currency} ${parsed.amount} | ${parsed.payerName} (${parsed.maskedAccount}) via ${parsed.paymentChannel} at ${parsed.merchantName} | APV: ${parsed.apv}`
     );
     return true;
   } catch (e) {
-    savedTrxMemory.delete(trxId);
-    console.error("Firestore write error:", e.message || e);
+    const errMsg = String(e?.message || e || "");
+    if (e?.code === 8 || /RESOURCE_EXHAUSTED|Quota exceeded/i.test(errMsg)) {
+      // Pause Firestore writes for 10 minutes so we don't spam errors; SSE & /recent still work 100%!
+      firestoreQuotaExhaustedUntil = Date.now() + 10 * 60 * 1000;
+      console.warn(
+        "⚠️ Firestore Daily Quota Exhausted — Serving payments directly via Render SSE (/events) & HTTP (/recent)!"
+      );
+      return true;
+    }
+    console.error("Firestore write warning (still available in /recent & SSE):", errMsg);
     return false;
   }
 }
 
-// 7. Use Native TCP Transport in Node.js (useWSS: false) for lowest latency
+// 7. Native TCP Transport in Node.js
 const client = new TelegramClient(new StringSession(sessionStr), apiId, apiHash, {
   connectionRetries: 10,
   retryDelay: 1000,
@@ -311,10 +422,11 @@ client.addEventHandler(async (ev) => {
     );
     if (!isChatAllowed(incomingChatId)) return;
 
-    const parsed = parseABAPayWay(rawMessage, Date.now());
+    const nowMs = Date.now();
+    const parsed = parseABAPayWay(rawMessage, nowMs);
     if (!parsed) return;
 
-    await saveParsedPaymentToFirestore(parsed, incomingChatId);
+    await saveParsedPaymentToFirestore(parsed, incomingChatId, nowMs);
   } catch (err) {}
 }, new NewMessage({}));
 
@@ -334,14 +446,15 @@ client.addEventHandler(async (update) => {
 
     if (!isChatAllowed(rawPeerId)) return;
 
-    const parsed = parseABAPayWay(rawText, Date.now());
+    const nowMs = Date.now();
+    const parsed = parseABAPayWay(rawText, nowMs);
     if (!parsed) return;
 
-    await saveParsedPaymentToFirestore(parsed, rawPeerId);
+    await saveParsedPaymentToFirestore(parsed, rawPeerId, nowMs);
   } catch (err) {}
 });
 
-// 9. FAST PARALLEL TARGET-GROUP SWEEP (Every 3.5 Seconds — No Sequential 400ms Sleeps!)
+// 9. FAST PARALLEL TARGET-GROUP SWEEP (Every 3.5 Seconds)
 let cachedTargetDialogs = [];
 let lastDialogRefreshMs = 0;
 let isSweeping = false;
@@ -352,7 +465,7 @@ async function syncRecentGroupHistory(isInitialBoot = false) {
   try {
     const now = Date.now();
     if (isInitialBoot || cachedTargetDialogs.length === 0 || now - lastDialogRefreshMs > 300000) {
-      const dialogs = await client.getDialogs({ limit: 20 });
+      const dialogs = await client.getDialogs({ limit: 35 });
       cachedTargetDialogs = dialogs.filter((d) => {
         const dialogIdStr = String(d.id || "");
         return (d.isGroup || d.isChannel) && isChatAllowed(dialogIdStr);
@@ -360,20 +473,23 @@ async function syncRecentGroupHistory(isInitialBoot = false) {
       lastDialogRefreshMs = now;
     }
 
-    // Poll all target PayWay groups in PARALLEL without blocking 400ms sleeps
     await Promise.all(
       cachedTargetDialogs.map(async (d) => {
         try {
           const dialogIdStr = String(d.id || "");
-          const messages = await client.getMessages(d.entity, { limit: isInitialBoot ? 10 : 4 });
+          const messages = await client.getMessages(d.entity, { limit: isInitialBoot ? 15 : 5 });
           for (const msg of messages) {
             const text = msg?.message || msg?.text || "";
             if (!text) continue;
             const msgServerMs = msg.date ? Number(msg.date) * 1000 : Date.now();
-            const effectiveMs = Math.abs(Date.now() - msgServerMs) < 120000 ? Date.now() : msgServerMs;
+            // Preserve exact Telegram server timestamp for historical messages on boot/wake-up!
+            const effectiveMs =
+              !isInitialBoot && Math.abs(Date.now() - msgServerMs) < 90000
+                ? Date.now()
+                : msgServerMs;
             const parsed = parseABAPayWay(text, effectiveMs);
             if (parsed) {
-              await saveParsedPaymentToFirestore(parsed, dialogIdStr);
+              await saveParsedPaymentToFirestore(parsed, dialogIdStr, effectiveMs);
             }
           }
         } catch (innerErr) {}
@@ -389,5 +505,4 @@ async function syncRecentGroupHistory(isInitialBoot = false) {
 }
 
 await syncRecentGroupHistory(true);
-// Keep MTProto channel state warm every 3.5 seconds (instead of 60 seconds!)
 setInterval(() => syncRecentGroupHistory(false), 3500);
